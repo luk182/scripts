@@ -2,8 +2,7 @@
 <#
 .SYNOPSIS
     Collects Azure resource utilization metrics (last calendar month) across one or more subscriptions
-    and exports the results to a multi-tab Excel workbook. Also inventories orphaned (unattached)
-    managed disks with an estimated monthly cost pulled from the public Azure Retail Prices API.
+    and exports the results to a multi-tab Excel workbook.
 
 .DESCRIPTION
     Every metric used below was looked up and confirmed against the live Microsoft Learn
@@ -27,8 +26,6 @@
     | Microsoft.Sql/managedInstances (SQL MI)        | Avg & Max CPU %                 | `avg_cpu_percent`                                                         | /azure/azure-monitor/reference/supported-metrics/microsoft-sql-managedinstances-metrics                                      |
     | Microsoft.Sql/managedInstances (SQL MI)        | Max Memory Used %              | Not available - no memory metric exists for this resource type in Azure Monitor (confirmed against the live docs) | /azure/azure-monitor/reference/supported-metrics/microsoft-sql-managedinstances-metrics |
     | Microsoft.CognitiveServices/accounts           | Max Provisioned-managed v2 %    | `AzureOpenAIProvisionedManagedUtilizationV2`                              | /azure/azure-monitor/reference/supported-metrics/microsoft-cognitiveservices-accounts-metrics                                |
-    | Microsoft.Compute/disks                        | Orphaned (unattached) disks     | `properties.diskState == 'Unattached'` via Azure Resource Graph           | Azure Resource Graph "resources" table, community-documented, verified live against Resource Graph schema                    |
-    | Managed disk pricing                           | Estimated monthly cost          | Azure Retail Prices API (`https://prices.azure.com/api/retail/prices`)    | /rest/api/cost-management/retail-prices/azure-retail-prices                                                                  |
 
     NOTE on aggregation technique: Azure Monitor Metrics only lets you request one time grain per
     call. To get a true Avg/Max over an entire month without exceeding the metrics API's per-call
@@ -48,8 +45,8 @@
     rather than silently defaulting to your home tenant.
 
 .PARAMETER OutputPath
-    Path to the .xlsx file to create. Defaults to .\AzureUtilizationReport_<yyyyMMdd>.xlsx in the
-    current directory.
+    Path to the .xlsx file to create. Defaults to .\AzureUtilizationReport_<yyyyMMdd_HHmm>.xlsx in
+    the current directory.
 
 .PARAMETER ReportMonth
     Optional "yyyy-MM" string to report on a specific past calendar month. Defaults to last full
@@ -72,7 +69,7 @@ param(
     # to your home tenant.
     [string] $TenantId,
 
-    [string] $OutputPath = ".\AzureUtilizationReport_$(Get-Date -Format 'yyyyMMdd').xlsx",
+    [string] $OutputPath = ".\AzureUtilizationReport_$(Get-Date -Format 'yyyyMMdd_HHmm').xlsx",
 
     [ValidatePattern('^\d{4}-(0[1-9]|1[0-2])$')]
     [string] $ReportMonth,
@@ -110,7 +107,7 @@ the other Az modules this script uses. PowerShell cannot swap a loaded module's 
 
 FIX: Close this terminal/session entirely and open a brand-new PowerShell window (or a new VS Code
 integrated terminal), then re-run this script. If the error persists, run:
-    Update-Module -Name Az.Accounts, Az.Resources, Az.Monitor, Az.ResourceGraph, Az.OperationalInsights, Az.Storage -Force
+    Update-Module -Name Az.Accounts, Az.Resources, Az.Monitor, Az.OperationalInsights, Az.Storage -Force
 in a fresh session first to align all Az module versions, then open another new session to run the report.
 More info: https://aka.ms/azps-version-error
 "@
@@ -131,7 +128,7 @@ Write-Host "Checking required modules..." -ForegroundColor Cyan
 # Az.Accounts must be imported first and explicitly, since every other Az.* module depends on it
 # and will otherwise trigger its own (less clear) implicit import with a potentially mismatched version.
 Install-RequiredModule -Name 'Az.Accounts'
-foreach ($m in @('Az.Resources', 'Az.Monitor', 'Az.ResourceGraph', 'Az.OperationalInsights', 'Az.Storage', 'ImportExcel')) {
+foreach ($m in @('Az.Resources', 'Az.Monitor', 'Az.OperationalInsights', 'Az.Storage', 'ImportExcel')) {
     Install-RequiredModule -Name $m
 }
 
@@ -256,7 +253,6 @@ $fileRows = [System.Collections.Generic.List[object]]::new()
 $sqlDbRows = [System.Collections.Generic.List[object]]::new()
 $sqlMiRows = [System.Collections.Generic.List[object]]::new()
 $cogRows = [System.Collections.Generic.List[object]]::new()
-$diskRows = [System.Collections.Generic.List[object]]::new()
 $errorRows = [System.Collections.Generic.List[object]]::new()
 
 # ---------------------------------------------------------------------------
@@ -321,120 +317,7 @@ function Get-MonthlyMetricStat {
 }
 
 # ---------------------------------------------------------------------------
-# 2. Managed disk retail-price lookup (for orphaned disks section)
-# ---------------------------------------------------------------------------
-
-# Azure managed disk size -> tier breakpoints (GiB), published on the Managed Disks pricing page.
-# Same breakpoints are reused across Premium SSD (P-series), Standard SSD (E-series) and
-# Standard HDD (S-series); Azure always bills the smallest tier that is >= the provisioned size.
-$script:DiskTierBreakpoints = [ordered]@{
-    4 = 1; 8 = 2; 16 = 3; 32 = 4; 64 = 6; 128 = 10; 256 = 15; 512 = 20
-    1024 = 30; 2048 = 40; 4096 = 50; 8192 = 60; 16384 = 70; 32767 = 80
-}
-
-function Get-DiskTierNumber {
-    param([Parameter(Mandatory)] [double] $SizeGB)
-    foreach ($breakpoint in $script:DiskTierBreakpoints.Keys) {
-        if ($SizeGB -le $breakpoint) { return $script:DiskTierBreakpoints[$breakpoint] }
-    }
-    return $script:DiskTierBreakpoints[32767]
-}
-
-$script:PriceCache = @{}
-
-<#
-    Returns an estimated USD monthly cost for a managed disk using the public, unauthenticated
-    Azure Retail Prices API (https://prices.azure.com/api/retail/prices).
-    For Premium SSD v2 / Ultra Disk (billed per-GiB/hour capacity plus separate IOPS & throughput
-    meters) only the capacity component is estimated; this is called out in the Notes column.
-#>
-function Get-DiskMonthlyPrice {
-    param(
-        [Parameter(Mandatory)] [string] $SkuName,     # e.g. Premium_LRS, StandardSSD_ZRS, Standard_LRS, PremiumV2_LRS, UltraSSD_LRS
-        [Parameter(Mandatory)] [double] $SizeGB,
-        [Parameter(Mandatory)] [string] $Region        # ARM region name, e.g. eastus
-    )
-
-    $redundancy = if ($SkuName -match 'ZRS') { 'ZRS' } else { 'LRS' }
-    $notes = $null
-    $productName = $null
-    $skuLabel = $null
-
-    switch -Regex ($SkuName) {
-        '^Premium_LRS$|^Premium_ZRS$' {
-            $productName = 'Premium SSD Managed Disks'
-            $skuLabel = "P$(Get-DiskTierNumber -SizeGB $SizeGB) $redundancy"
-        }
-        '^StandardSSD_LRS$|^StandardSSD_ZRS$' {
-            $productName = 'Standard SSD Managed Disks'
-            $skuLabel = "E$(Get-DiskTierNumber -SizeGB $SizeGB) $redundancy"
-        }
-        '^Standard_LRS$' {
-            $productName = 'Standard HDD Managed Disks'
-            $skuLabel = "S$(Get-DiskTierNumber -SizeGB $SizeGB) $redundancy"
-        }
-        '^PremiumV2_LRS$' {
-            $productName = 'Azure Premium SSD v2'
-            $skuLabel = 'Premium LRS'
-            $notes = 'Premium SSD v2 is billed per-GiB/hour capacity plus separate IOPS/throughput meters; cost shown is the capacity component only.'
-        }
-        '^UltraSSD_LRS$' {
-            $productName = 'Ultra Disks'
-            $skuLabel = 'Ultra LRS'
-            $notes = 'Ultra Disk is billed per-GiB/hour capacity plus separate IOPS/throughput meters; cost shown is the capacity component only (approximate, uses Ultra LRS base rate).'
-        }
-        default {
-            return [pscustomobject]@{ MonthlyCost = $null; Currency = $null; Notes = "Unrecognized SKU '$SkuName' - no price lookup performed." }
-        }
-    }
-
-    $cacheKey = "$productName|$skuLabel|$Region"
-    if ($script:PriceCache.ContainsKey($cacheKey)) {
-        $cached = $script:PriceCache[$cacheKey]
-        return [pscustomobject]@{ MonthlyCost = $cached.MonthlyCost; Currency = $cached.Currency; Notes = $notes }
-    }
-
-    try {
-        $filter = "serviceName eq 'Storage' and armRegionName eq '$Region' and productName eq '$productName' and priceType eq 'Consumption'"
-        $uri = "https://prices.azure.com/api/retail/prices?`$filter=$([uri]::EscapeDataString($filter))"
-        $resp = Invoke-RestMethod -Uri $uri -Method Get
-
-        if ($productName -in @('Azure Premium SSD v2', 'Ultra Disks')) {
-            # Per-GiB/hour capacity meter (exclude Mount/Operations/Snapshot/IOPS/Throughput meters)
-            $item = $resp.Items | Where-Object {
-                $_.skuName -eq $skuLabel -and $_.meterName -match 'Provisioned Capacity' -and $_.unitOfMeasure -match 'GiB/Hour|GB/Hour'
-            } | Select-Object -First 1
-            if ($item) {
-                $monthlyCost = [math]::Round($item.retailPrice * $SizeGB * 730, 2) # 730 average hours/month
-                $currency = $item.currencyCode
-            }
-        }
-        else {
-            # Flat monthly per-tier meter, excluding Mount (hourly multi-attach fee) and Operations (transaction) meters
-            $item = $resp.Items | Where-Object {
-                $_.skuName -eq $skuLabel -and $_.meterName -notmatch 'Mount|Operations|Snapshot' -and $_.unitOfMeasure -match '1/Month'
-            } | Select-Object -First 1
-            if ($item) {
-                $monthlyCost = [math]::Round([double]$item.retailPrice, 2)
-                $currency = $item.currencyCode
-            }
-        }
-
-        if (-not $item) {
-            $script:PriceCache[$cacheKey] = @{ MonthlyCost = $null; Currency = $null }
-            return [pscustomobject]@{ MonthlyCost = $null; Currency = $null; Notes = "No matching retail price meter found for SKU '$skuLabel' in region '$Region'." }
-        }
-
-        $script:PriceCache[$cacheKey] = @{ MonthlyCost = $monthlyCost; Currency = $currency }
-        return [pscustomobject]@{ MonthlyCost = $monthlyCost; Currency = $currency; Notes = $notes }
-    }
-    catch {
-        return [pscustomobject]@{ MonthlyCost = $null; Currency = $null; Notes = "Retail Prices API lookup failed: $($_.Exception.Message)" }
-    }
-}
-
-# ---------------------------------------------------------------------------
-# 3. Per-subscription collection
+# 2. Per-subscription collection
 # ---------------------------------------------------------------------------
 
 foreach ($sub in $subs) {
@@ -442,7 +325,7 @@ foreach ($sub in $subs) {
     Write-Host "`n=== Subscription: $($sub.Name) ($($sub.Id)) ===" -ForegroundColor Green
     Set-AzContext -Subscription $sub.Id -Tenant $targetTenantId | Out-Null
 
-    # --- 3.1 Virtual Machines: Percentage CPU (Avg/Max) + Max Memory Used % ---------------------
+    # --- 2.1 Virtual Machines: Percentage CPU (Avg/Max) + Max Memory Used % ---------------------
     Write-Host "  Collecting VM CPU and memory utilization..."
     $vms = Get-AzResource -ResourceType 'Microsoft.Compute/virtualMachines'
     foreach ($vm in $vms) {
@@ -481,7 +364,7 @@ foreach ($sub in $subs) {
         catch { Add-ErrorRow $sub.Name 'VM' $vm.Name $_.Exception.Message }
     }
 
-    # --- 3.2 API Management: units + Avg Gateway CPU % ------------------------------------------
+    # --- 2.2 API Management: units + Avg Gateway CPU % ------------------------------------------
     Write-Host "  Collecting API Management utilization..."
     $apims = Get-AzResource -ResourceType 'Microsoft.ApiManagement/service'
     foreach ($apim in $apims) {
@@ -514,7 +397,7 @@ foreach ($sub in $subs) {
         catch { Add-ErrorRow $sub.Name 'APIM' $apim.Name $_.Exception.Message }
     }
 
-    # --- 3.3 App Service Plans: Avg & Max CPU % --------------------------------------------------
+    # --- 2.3 App Service Plans: Avg & Max CPU % --------------------------------------------------
     Write-Host "  Collecting App Service Plan CPU utilization..."
     $plans = Get-AzResource -ResourceType 'Microsoft.Web/serverfarms'
     foreach ($plan in $plans) {
@@ -535,7 +418,7 @@ foreach ($sub in $subs) {
         catch { Add-ErrorRow $sub.Name 'AppServicePlan' $plan.Name $_.Exception.Message }
     }
 
-    # --- 3.4 Sentinel / Log Analytics: Avg daily ingestion + commitment tier ---------------------
+    # --- 2.4 Sentinel / Log Analytics: Avg daily ingestion + commitment tier ---------------------
     Write-Host "  Collecting Sentinel ingestion and commitment tier..."
     $workspaces = Get-AzResource -ResourceType 'Microsoft.OperationalInsights/workspaces'
     foreach ($ws in $workspaces) {
@@ -584,7 +467,7 @@ Usage
         catch { Add-ErrorRow $sub.Name 'Sentinel/LogAnalytics' $ws.Name $_.Exception.Message }
     }
 
-    # --- 3.5 Storage accounts (Premium Files, provisioned): used vs allocated per share ----------
+    # --- 2.5 Storage accounts (Premium Files, provisioned): used vs allocated per share ----------
     Write-Host "  Collecting Premium Files (provisioned) share capacity..."
     $storageAccounts = Get-AzStorageAccount
     # Kind 'FileStorage' is, per Microsoft's own documentation, exclusively used for Premium Files
@@ -607,16 +490,19 @@ Usage
                 -AggregationType Average -Dimension 'FileShare' -DetailedOutput `
                 -WarningAction SilentlyContinue
 
-            $shareNames = @()
-            if ($usedMetric.Data) { $shareNames += ($usedMetric.Data | ForEach-Object { $_.Timeseries.Metadatavalue.Value }) }
-            $shareNames = $shareNames | Select-Object -Unique
+            # With -DetailedOutput, Get-AzMetric returns the per-dimension breakdown on the metric
+            # object's own .Timeseries property (one TimeSeriesElement per FileShare), each with its
+            # own .Metadatavalues (the FileShare name) and .Data (the actual data points) - NOT
+            # nested under .Data as might be assumed. (Verified directly against the installed
+            # Az.Monitor assembly's PSMetric/TimeSeriesElement/MetadataValue type definitions.)
+            foreach ($series in $usedMetric.Timeseries) {
+                $shareName = $series.Metadatavalues | Select-Object -First 1 -ExpandProperty Value
+                $usedBytes = ($series.Data.Average | Where-Object { $null -ne $_ } | Measure-Object -Maximum).Maximum
 
-            foreach ($series in $usedMetric.Data) {
-                $shareName = $series.Timeseries.Metadatavalue.Value | Select-Object -First 1
-                $usedBytes = ($series.Timeseries.Data.Average | Where-Object { $null -ne $_ } | Measure-Object -Maximum).Maximum
-
-                $quotaSeries = $quotaMetric.Data | Where-Object { ($_.Timeseries.Metadatavalue.Value | Select-Object -First 1) -eq $shareName }
-                $quotaBytes = ($quotaSeries.Timeseries.Data.Average | Where-Object { $null -ne $_ } | Measure-Object -Maximum).Maximum
+                $quotaSeries = $quotaMetric.Timeseries | Where-Object {
+                    ($_.Metadatavalues | Select-Object -First 1 -ExpandProperty Value) -eq $shareName
+                }
+                $quotaBytes = ($quotaSeries.Data.Average | Where-Object { $null -ne $_ } | Measure-Object -Maximum).Maximum
 
                 $fileRows.Add([pscustomobject]@{
                         Subscription      = $sub.Name
@@ -632,7 +518,7 @@ Usage
         catch { Add-ErrorRow $sub.Name 'StorageAccount-PremiumFiles' $sa.StorageAccountName $_.Exception.Message }
     }
 
-    # --- 3.6 Azure SQL Database: Avg/Max CPU % + Max Memory Used % -------------------------------
+    # --- 2.6 Azure SQL Database: Avg/Max CPU % + Max Memory Used % -------------------------------
     Write-Host "  Collecting Azure SQL Database CPU and memory utilization..."
     $sqlServers = Get-AzResource -ResourceType 'Microsoft.Sql/servers'
     foreach ($srv in $sqlServers) {
@@ -669,7 +555,7 @@ Usage
         }
     }
 
-    # --- 3.7 SQL Managed Instance: Avg/Max CPU % -------------------------------------------------
+    # --- 2.7 SQL Managed Instance: Avg/Max CPU % -------------------------------------------------
     # NOTE: Microsoft.Sql/managedInstances has no memory utilization metric in Azure Monitor
     # (confirmed against the live supported-metrics reference page - only CPU, worker, I/O, log
     # rate, storage and vCore count metrics are exposed), so MaxMemoryUsedPercent is always null
@@ -693,7 +579,7 @@ Usage
         catch { Add-ErrorRow $sub.Name 'SQLManagedInstance' $mi.Name $_.Exception.Message }
     }
 
-    # --- 3.8 Cognitive Services: Max Provisioned-managed v2 utilization % ------------------------
+    # --- 2.8 Cognitive Services: Max Provisioned-managed v2 utilization % ------------------------
     Write-Host "  Collecting Cognitive Services provisioned-managed (PTU v2) utilization..."
     $cogAccounts = Get-AzResource -ResourceType 'Microsoft.CognitiveServices/accounts'
     foreach ($acct in $cogAccounts) {
@@ -724,40 +610,10 @@ Usage
                 Notes                                     = $note
             })
     }
-
-    # --- 3.9 Orphaned (unattached) managed disks + price lookup ---------------------------------
-    Write-Host "  Collecting orphaned (unattached) managed disks..."
-    try {
-        $unattached = Search-AzGraph -Subscription $sub.Id -Query @"
-resources
-| where type == 'microsoft.compute/disks'
-| where tostring(properties.diskState) == 'Unattached'
-| project name, resourceGroup, location, subscriptionId,
-    skuName = tostring(sku.name),
-    sizeGb = toint(properties.diskSizeGB),
-    timeCreated = tostring(properties.timeCreated)
-"@
-        foreach ($disk in $unattached) {
-            $price = Get-DiskMonthlyPrice -SkuName $disk.skuName -SizeGB $disk.sizeGb -Region $disk.location
-            $diskRows.Add([pscustomobject]@{
-                    Subscription   = $sub.Name
-                    ResourceGroup  = $disk.resourceGroup
-                    DiskName       = $disk.name
-                    Location       = $disk.location
-                    Sku            = $disk.skuName
-                    SizeGB         = $disk.sizeGb
-                    TimeCreated    = $disk.timeCreated
-                    EstMonthlyCost = $price.MonthlyCost
-                    Currency       = $price.Currency
-                    Notes          = $price.Notes
-                })
-        }
-    }
-    catch { Add-ErrorRow $sub.Name 'OrphanedDisks' '(subscription-wide query)' $_.Exception.Message }
 }
 
 # ---------------------------------------------------------------------------
-# 4. Metric reference sheet (for audit / traceability)
+# 3. Metric reference sheet (for audit / traceability)
 # ---------------------------------------------------------------------------
 
 $metricReference = @(
@@ -775,12 +631,10 @@ $metricReference = @(
     [pscustomobject]@{ ResourceType = 'Microsoft.Sql/managedInstances'; Metric = 'avg_cpu_percent'; Kind = 'Azure Monitor metric'; Source = 'learn.microsoft.com/azure/azure-monitor/reference/supported-metrics/microsoft-sql-managedinstances-metrics' }
     [pscustomobject]@{ ResourceType = 'Microsoft.Sql/managedInstances'; Metric = 'No memory metric exists for this resource type (confirmed against live docs)'; Kind = 'N/A'; Source = 'learn.microsoft.com/azure/azure-monitor/reference/supported-metrics/microsoft-sql-managedinstances-metrics' }
     [pscustomobject]@{ ResourceType = 'Microsoft.CognitiveServices/accounts'; Metric = 'AzureOpenAIProvisionedManagedUtilizationV2'; Kind = 'Azure Monitor metric'; Source = 'learn.microsoft.com/azure/azure-monitor/reference/supported-metrics/microsoft-cognitiveservices-accounts-metrics' }
-    [pscustomobject]@{ ResourceType = 'Microsoft.Compute/disks'; Metric = "properties.diskState == 'Unattached'"; Kind = 'Azure Resource Graph query'; Source = 'Azure Resource Graph "resources" table' }
-    [pscustomobject]@{ ResourceType = 'Managed disk pricing'; Metric = 'Retail Prices API'; Kind = 'REST API'; Source = 'learn.microsoft.com/rest/api/cost-management/retail-prices/azure-retail-prices' }
 )
 
 # ---------------------------------------------------------------------------
-# 5. Export to Excel (one worksheet per resource type)
+# 4. Export to Excel (one worksheet per resource type)
 # ---------------------------------------------------------------------------
 
 if (Test-Path $OutputPath) { Remove-Item $OutputPath -Force }
@@ -796,7 +650,6 @@ $sheets = [ordered]@{
     'AzureSQL-CPU'          = $sqlDbRows
     'SQLMI-CPU'             = $sqlMiRows
     'CognitiveServices-PTU' = $cogRows
-    'OrphanedDisks'         = $diskRows
     'Metric-Reference'      = $metricReference
     'Collection-Errors'     = $errorRows
 }
