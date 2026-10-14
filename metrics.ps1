@@ -13,7 +13,7 @@
     | Resource type            | What we report                              | Azure Monitor metric / property (REST name)                              | Source (Microsoft Learn)                                                                                                   |
     |---------------------------|----------------------------------------------|----------------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------|
     | Microsoft.Compute/virtualMachines            | Avg & Max CPU %                | `Percentage CPU`                                                          | /azure/azure-monitor/reference/supported-metrics/microsoft-compute-virtualmachines-metrics                                  |
-    | Microsoft.Compute/virtualMachines            | Max Memory Used % (= 100 - min Available Memory %) | `Available Memory Percentage` (guest-OS metric, requires Azure Monitor Agent) | /azure/azure-monitor/reference/supported-metrics/microsoft-compute-virtualmachines-metrics                      |
+    | Microsoft.Compute/virtualMachines            | Max Memory Used % (= 100 - min Available Memory %) | `Available Memory Percentage` (Host OS platform metric - no agent required; confirmed via /azure/virtual-machines/monitor-vm-reference) | /azure/azure-monitor/reference/supported-metrics/microsoft-compute-virtualmachines-metrics                      |
     | Microsoft.ApiManagement/service               | Scale units (capacity)         | `sku.capacity` resource property (not an Azure Monitor metric)            | /powershell/module/az.apimanagement/get-azapimanagement                                                                      |
     | Microsoft.ApiManagement/service               | Avg Gateway CPU %              | `Capacity` (classic SKUs) / `CpuPercent_Gateway` (v2 SKUs)                | /azure/azure-monitor/reference/supported-metrics/microsoft-apimanagement-service-metrics                                     |
     | Microsoft.Web/serverfarms (App Service Plan)  | Max CPU %                       | `CpuPercentage`                                                           | /azure/azure-monitor/reference/supported-metrics/microsoft-web-serverfarms-metrics                                           |
@@ -21,11 +21,15 @@
     | Microsoft Sentinel (Log Analytics workspace)  | Avg daily ingestion (GB/day)   | `Usage` table KQL query (no native Azure Monitor platform metric exists)  | /azure/azure-monitor/logs/analyze-usage ; confirmed no ingestion metric exists on microsoft-operationalinsights-workspaces-metrics |
     | Microsoft Sentinel / Log Analytics workspace  | Daily commitment tier in place | `sku.capacityReservationLevel` resource property                         | /azure/templates/microsoft.operationalinsights/workspaces                                                                    |
     | Microsoft.Storage/storageAccounts/fileServices (Premium Files) | Used vs allocated per share | `FileCapacity` (used, bytes) & `FileShareCapacityQuota` (allocated, bytes), split by `FileShare` dimension | /azure/azure-monitor/reference/supported-metrics/microsoft-storage-storageaccounts-fileservices-metrics |
-    | Microsoft.Sql/servers/databases (Azure SQL DB)| Avg & Max CPU %                 | `cpu_percent`                                                             | /azure/azure-monitor/reference/supported-metrics/microsoft-sql-servers-databases-metrics                                     |
+    | Microsoft.Sql/servers/databases (Azure SQL DB)| Edition, deployment type (Single/Elastic Pool), cores/DTUs, metering model | `sku.tier`, `sku.capacity`, `sku.family`, `properties.elasticPoolId` resource properties | /azure/templates/microsoft.sql/servers/databases |
+    | Microsoft.Sql/servers/databases (Azure SQL DB)| Status (Online/Paused/Standby/etc.) and replica role (Geo/Named/Standby secondary) | `properties.status`, `properties.secondaryType` resource properties | /azure/templates/microsoft.sql/servers/databases |
+    | Microsoft.Sql/servers/databases (Azure SQL DB)| Max CPU % (regular + full SQL instance)| `cpu_percent`, `sql_instance_cpu_percent`                                | /azure/azure-monitor/reference/supported-metrics/microsoft-sql-servers-databases-metrics                                     |
     | Microsoft.Sql/servers/databases (Azure SQL DB)| Max Memory Used %              | `sql_instance_memory_percent`                                             | /azure/azure-monitor/reference/supported-metrics/microsoft-sql-servers-databases-metrics                                     |
-    | Microsoft.Sql/managedInstances (SQL MI)        | Avg & Max CPU %                 | `avg_cpu_percent`                                                         | /azure/azure-monitor/reference/supported-metrics/microsoft-sql-managedinstances-metrics                                      |
+    | Microsoft.Sql/servers/databases (Azure SQL DB)| Max DTU % (DTU-based only), Max storage/workers/sessions % | `dtu_consumption_percent`, `storage_percent`, `workers_percent`, `sessions_percent` | /azure/azure-monitor/reference/supported-metrics/microsoft-sql-servers-databases-metrics |
+    | Microsoft.Sql/servers/elasticPools              | Edition, cores/DTUs, per-DB min/max, Max CPU/storage/workers/sessions % | `sku.*` resource properties + `cpu_percent`, `storage_percent`, `workers_percent`, `sessions_percent` | /azure/azure-monitor/reference/supported-metrics/microsoft-sql-servers-elasticpools-metrics |
+    | Microsoft.Sql/managedInstances (SQL MI)        | Edition, cores, storage size, state, Avg & Max CPU %, Max workers %, storage used | `sku.tier`, `properties.vCores`, `properties.state`, `avg_cpu_percent`, `avg_workers_percent`, `storage_space_used_mb`, `reserved_storage_mb` | /azure/azure-monitor/reference/supported-metrics/microsoft-sql-managedinstances-metrics |
     | Microsoft.Sql/managedInstances (SQL MI)        | Max Memory Used %              | Not available - no memory metric exists for this resource type in Azure Monitor (confirmed against the live docs) | /azure/azure-monitor/reference/supported-metrics/microsoft-sql-managedinstances-metrics |
-    | Microsoft.CognitiveServices/accounts           | Max Provisioned-managed v2 %    | `AzureOpenAIProvisionedManagedUtilizationV2`                              | /azure/azure-monitor/reference/supported-metrics/microsoft-cognitiveservices-accounts-metrics                                |
+    | Microsoft.CognitiveServices/accounts/deployments (PTU only) | Max Provisioned-managed v2 % over the last 30 days, per deployment | `AzureOpenAIProvisionedManagedUtilizationV2` filtered by the `ModelDeploymentName` dimension; deployments discovered/filtered to `*ProvisionedManaged*` SKUs via the `deployments` REST API | /azure/azure-monitor/reference/supported-metrics/microsoft-cognitiveservices-accounts-metrics                                |
 
     NOTE on aggregation technique: Azure Monitor Metrics only lets you request one time grain per
     call. To get a true Avg/Max over an entire month without exceeding the metrics API's per-call
@@ -233,7 +237,13 @@ else {
 $EndDate = $StartDate.AddMonths(1)
 $TimeGrain = New-TimeSpan -Hours $TimeGrainHours
 
+# Separate trailing 30-day window (ending "now", not the last-calendar-month window above) used
+# specifically for Cognitive Services / AI Foundry PTU utilization, per client request.
+$Last30dEndDate = (Get-Date).ToUniversalTime()
+$Last30dStartDate = $Last30dEndDate.AddDays(-30)
+
 Write-Host "Reporting window: $($StartDate.ToString('u')) -> $($EndDate.ToString('u')) (UTC)" -ForegroundColor Cyan
+Write-Host "PTU utilization window (last 30 days): $($Last30dStartDate.ToString('u')) -> $($Last30dEndDate.ToString('u')) (UTC)" -ForegroundColor Cyan
 
 # Resolve subscriptions to scan (explicitly pinned to the selected tenant)
 if ($SubscriptionId) {
@@ -251,6 +261,7 @@ $aspRows = [System.Collections.Generic.List[object]]::new()
 $sentinelRows = [System.Collections.Generic.List[object]]::new()
 $fileRows = [System.Collections.Generic.List[object]]::new()
 $sqlDbRows = [System.Collections.Generic.List[object]]::new()
+$sqlPoolRows = [System.Collections.Generic.List[object]]::new()
 $sqlMiRows = [System.Collections.Generic.List[object]]::new()
 $cogRows = [System.Collections.Generic.List[object]]::new()
 $errorRows = [System.Collections.Generic.List[object]]::new()
@@ -270,6 +281,47 @@ function Add-ErrorRow {
 }
 
 <#
+    Get-AzResource (used generically, e.g. "Get-AzResource -ResourceType 'Microsoft.Sql/servers/databases'")
+    goes through the generic Microsoft.Resources resource-list API rather than the SQL resource
+    provider's own list endpoint. That generic API is documented/known to come back with the
+    type-specific `Properties` payload null or empty for many resource types - which is exactly why
+    fields like Status, secondaryType, elasticPoolId, vCores, perDatabaseSettings, etc. were blank
+    for every SQL row even though the field-mapping code itself was correct. Querying the SQL RP's
+    own REST list endpoint directly (same direct-REST technique already used elsewhere in this
+    script for Sentinel onboarding states and Cognitive Services deployments) guarantees the full,
+    real payload is present. Returns plain PSCustomObjects shaped like Get-AzResource's output
+    (ResourceId/Name/Location/ResourceGroupName/Sku/Properties) so the rest of the script is
+    unaffected, except each object's Name is now just its own short name (not "parent/child").
+#>
+function Get-AzSqlChildResourceFull {
+    param(
+        [Parameter(Mandatory)] [string] $Path,
+        [Parameter(Mandatory)] [string] $ApiVersion
+    )
+
+    $results = [System.Collections.Generic.List[object]]::new()
+    $separator = if ($Path -match '\?') { '&' } else { '?' }
+    $nextPath = "$Path$separator" + "api-version=$ApiVersion"
+    while ($nextPath) {
+        $resp = Invoke-AzRestMethod -Path $nextPath -Method GET
+        if ($resp.StatusCode -ne 200) { break }
+        $body = $resp.Content | ConvertFrom-Json
+        foreach ($item in $body.value) {
+            $results.Add([pscustomobject]@{
+                    ResourceId        = $item.id
+                    Name              = $item.name
+                    Location          = $item.location
+                    ResourceGroupName = ($item.id -split '/')[4]
+                    Sku               = $item.sku
+                    Properties        = $item.properties
+                })
+        }
+        $nextPath = if ($body.nextLink) { ($body.nextLink -replace '^https://[^/]+', '') } else { $null }
+    }
+    return $results
+}
+
+<#
     Queries one metric at hourly grain for the whole reporting window and returns the
     month-level Average and Maximum per the technique described in the header comment.
 
@@ -283,7 +335,16 @@ function Get-MonthlyMetricStat {
         [Parameter(Mandatory)] [string] $ResourceId,
         [Parameter(Mandatory)] [string] $MetricName,
         [string] $MetricNamespace,
-        [string[]] $AggregationType = @('Average', 'Maximum')
+        # OData filter used to split/filter a dimensioned metric down to a single dimension value,
+        # e.g. "ModelDeploymentName eq 'my-deployment'" for the Cognitive Services PTU metric. Without
+        # this, a dimensioned metric queried at the resource level is blended/ambiguous across all of
+        # that dimension's values (e.g. across every model deployment on the account).
+        [string] $MetricFilter,
+        [string[]] $AggregationType = @('Average', 'Maximum'),
+        # Allow callers to override the reporting window (e.g. a trailing 30-day window instead of
+        # the script's default last-calendar-month window used everywhere else).
+        [datetime] $StartTime = $StartDate,
+        [datetime] $EndTime = $EndDate
     )
 
     $result = [pscustomobject]@{ Avg = $null; Max = $null; Min = $null }
@@ -293,13 +354,14 @@ function Get-MonthlyMetricStat {
             ResourceId      = $ResourceId
             MetricName      = $MetricName
             TimeGrain       = $TimeGrain
-            StartTime       = $StartDate
-            EndTime         = $EndDate
+            StartTime       = $StartTime
+            EndTime         = $EndTime
             AggregationType = $agg
             WarningAction   = 'SilentlyContinue'
             ErrorAction     = 'Stop'
         }
         if ($MetricNamespace) { $params['MetricNamespace'] = $MetricNamespace }
+        if ($MetricFilter) { $params['MetricFilter'] = $MetricFilter }
 
         $metric = Get-AzMetric @params
         $values = $metric.Data | Where-Object { $null -ne $_.$agg } | Select-Object -ExpandProperty $agg
@@ -518,97 +580,242 @@ Usage
         catch { Add-ErrorRow $sub.Name 'StorageAccount-PremiumFiles' $sa.StorageAccountName $_.Exception.Message }
     }
 
-    # --- 2.6 Azure SQL Database: Avg/Max CPU % + Max Memory Used % -------------------------------
-    Write-Host "  Collecting Azure SQL Database CPU and memory utilization..."
+    # --- 2.6 Azure SQL Database: deployment details, cores/DTUs, status, replica role, and the ----
+    #      right Max usage metrics for the type (CPU, SQL-instance CPU, memory, DTU, storage,
+    #      workers, sessions). Elastic pools are also reported separately (2.6b) since a pooled
+    #      database shares the pool's capacity rather than having its own.
+    Write-Host "  Collecting Azure SQL Database configuration and utilization..."
     $sqlServers = Get-AzResource -ResourceType 'Microsoft.Sql/servers'
     foreach ($srv in $sqlServers) {
-        $dbs = Get-AzResource -ResourceType 'Microsoft.Sql/servers/databases' -ResourceGroupName $srv.ResourceGroupName |
-        Where-Object { $_.Name -like "$($srv.Name)/*" -and $_.Name -notlike "*master" }
+
+        # --- 2.6b Elastic pools on this server: shared capacity + pool-level Max usage metrics ----
+        $pools = Get-AzSqlChildResourceFull -Path "$($srv.ResourceId)/elasticPools" -ApiVersion '2023-08-01'
+        $poolByName = @{}
+        foreach ($pool in $pools) { $poolByName[$pool.Name] = $pool }
+
+        foreach ($pool in $pools) {
+            try {
+                $poolCpuStat = Get-MonthlyMetricStat -ResourceId $pool.ResourceId -MetricName 'cpu_percent' -AggregationType @('Maximum')
+                $poolStorageStat = $null
+                try { $poolStorageStat = Get-MonthlyMetricStat -ResourceId $pool.ResourceId -MetricName 'storage_percent' -AggregationType @('Maximum') } catch {}
+                $poolWorkersStat = $null
+                try { $poolWorkersStat = Get-MonthlyMetricStat -ResourceId $pool.ResourceId -MetricName 'workers_percent' -AggregationType @('Maximum') } catch {}
+                $poolSessionsStat = $null
+                try { $poolSessionsStat = Get-MonthlyMetricStat -ResourceId $pool.ResourceId -MetricName 'sessions_percent' -AggregationType @('Maximum') } catch {}
+
+                $sqlPoolRows.Add([pscustomobject]@{
+                        Subscription       = $sub.Name
+                        ResourceGroup      = $pool.ResourceGroupName
+                        ServerName         = $srv.Name
+                        ElasticPoolName    = $pool.Name
+                        Location           = $pool.Location
+                        Edition            = $pool.Sku.Tier
+                        MeteringModel      = if ($pool.Sku.Family) { 'vCore' } else { 'DTU' }
+                        Cores              = if ($pool.Sku.Family) { $pool.Sku.Capacity } else { $null }
+                        DTUs               = if ($pool.Sku.Family) { $null } else { $pool.Sku.Capacity }
+                        PerDbMinCapacity   = $pool.Properties.perDatabaseSettings.minCapacity
+                        PerDbMaxCapacity   = $pool.Properties.perDatabaseSettings.maxCapacity
+                        ZoneRedundant      = $pool.Properties.zoneRedundant
+                        MaxCpuPercent      = $poolCpuStat.Max
+                        MaxStoragePercent  = $poolStorageStat.Max
+                        MaxWorkersPercent  = $poolWorkersStat.Max
+                        MaxSessionsPercent = $poolSessionsStat.Max
+                    })
+            }
+            catch { Add-ErrorRow $sub.Name 'SQLElasticPool' $pool.Name $_.Exception.Message }
+        }
+
+        $dbs = Get-AzSqlChildResourceFull -Path "$($srv.ResourceId)/databases" -ApiVersion '2023-08-01' |
+        Where-Object { $_.Name -ne 'master' }
         foreach ($db in $dbs) {
             try {
+                $isElasticPool = [bool]$db.Properties.elasticPoolId
+                $elasticPoolName = if ($isElasticPool) { ($db.Properties.elasticPoolId -split '/')[-1] } else { $null }
+                $poolInfo = if ($elasticPoolName) { $poolByName[$elasticPoolName] } else { $null }
+
+                # A pooled database's own Sku is just "ElasticPool" with no real tier/capacity, so
+                # fall back to the pool's Sku (GP/BC/HS/Standard/etc. + shared capacity) for it.
+                $effectiveSku = if ($poolInfo) { $poolInfo.Sku } else { $db.Sku }
+                $edition = $effectiveSku.Tier
+                $deploymentType = if ($isElasticPool) { 'Elastic Pool' } else { 'Single Database' }
+                $meteringModel = if ($edition -eq 'DataWarehouse') { 'DWU' } elseif ($effectiveSku.Family) { 'vCore' } else { 'DTU' }
+                $cores = if ($meteringModel -eq 'vCore') { $effectiveSku.Capacity } else { $null }
+                $dtus = if ($meteringModel -eq 'DTU') { $effectiveSku.Capacity } else { $null }
+
+                # secondaryType is only populated on secondary/replica databases: Geo (geo-replication
+                # / auto-failover group secondary), Named (Hyperscale named replica, usually readable),
+                # or Standby (Hyperscale named replica kept purely for failover - not readable).
+                $secondaryType = $db.Properties.secondaryType
+                $isReplica = [bool]$secondaryType
+                $isStandbyReplica = ($secondaryType -eq 'Standby')
+
                 $stat = Get-MonthlyMetricStat -ResourceId $db.ResourceId -MetricName 'cpu_percent'
 
-                # 'sql_instance_memory_percent' is not applicable to data warehouse (Synapse DW)
-                # databases, so a failure here is kept independent of the CPU result above.
+                # Each extra metric is queried independently so that one not applying to this
+                # edition/deployment model (e.g. DTU-only metrics on a vCore database, storage not
+                # applying to Hyperscale/Data Warehouse) never blocks the others.
+                $maxSqlInstanceCpuPercent = $null
+                try { $maxSqlInstanceCpuPercent = (Get-MonthlyMetricStat -ResourceId $db.ResourceId -MetricName 'sql_instance_cpu_percent' -AggregationType @('Maximum')).Max } catch {}
+
                 $memNote = $null
                 $maxMemPercent = $null
                 try {
-                    $memStat = Get-MonthlyMetricStat -ResourceId $db.ResourceId -MetricName 'sql_instance_memory_percent' -AggregationType @('Maximum')
-                    $maxMemPercent = $memStat.Max
+                    $maxMemPercent = (Get-MonthlyMetricStat -ResourceId $db.ResourceId -MetricName 'sql_instance_memory_percent' -AggregationType @('Maximum')).Max
                     if ($null -eq $maxMemPercent) { $memNote = 'No memory data reported (metric does not apply to data warehouse/Synapse databases).' }
                 }
                 catch { $memNote = "Memory metric query failed: $($_.Exception.Message)" }
 
+                $maxDtuPercent = $null
+                if ($meteringModel -eq 'DTU') {
+                    try { $maxDtuPercent = (Get-MonthlyMetricStat -ResourceId $db.ResourceId -MetricName 'dtu_consumption_percent' -AggregationType @('Maximum')).Max } catch {}
+                }
+
+                $maxStoragePercent = $null
+                if ($edition -notin @('Hyperscale', 'DataWarehouse')) {
+                    try { $maxStoragePercent = (Get-MonthlyMetricStat -ResourceId $db.ResourceId -MetricName 'storage_percent' -AggregationType @('Maximum')).Max } catch {}
+                }
+
+                $maxWorkersPercent = $null
+                try { $maxWorkersPercent = (Get-MonthlyMetricStat -ResourceId $db.ResourceId -MetricName 'workers_percent' -AggregationType @('Maximum')).Max } catch {}
+
+                $maxSessionsPercent = $null
+                try { $maxSessionsPercent = (Get-MonthlyMetricStat -ResourceId $db.ResourceId -MetricName 'sessions_percent' -AggregationType @('Maximum')).Max } catch {}
+
                 $sqlDbRows.Add([pscustomobject]@{
-                        Subscription         = $sub.Name
-                        ResourceGroup        = $db.ResourceGroupName
-                        ServerName           = $srv.Name
-                        DatabaseName         = ($db.Name -split '/')[-1]
-                        Location             = $db.Location
-                        AvgCpuPercent        = $stat.Avg
-                        MaxCpuPercent        = $stat.Max
-                        MaxMemoryUsedPercent = $maxMemPercent
-                        Notes                = $memNote
+                        Subscription             = $sub.Name
+                        ResourceGroup            = $db.ResourceGroupName
+                        ServerName               = $srv.Name
+                        DatabaseName             = $db.Name
+                        Location                 = $db.Location
+                        Status                   = $db.Properties.status
+                        Edition                  = $edition
+                        DeploymentType           = $deploymentType
+                        ElasticPoolName          = $elasticPoolName
+                        MeteringModel            = $meteringModel
+                        Cores                    = $cores
+                        DTUs                     = $dtus
+                        IsReplica                = $isReplica
+                        ReplicaType              = $secondaryType
+                        IsStandbyReplica         = $isStandbyReplica
+                        AvgCpuPercent            = $stat.Avg
+                        MaxCpuPercent            = $stat.Max
+                        MaxSqlInstanceCpuPercent = $maxSqlInstanceCpuPercent
+                        MaxMemoryUsedPercent     = $maxMemPercent
+                        MaxDtuPercent            = $maxDtuPercent
+                        MaxStoragePercent        = $maxStoragePercent
+                        MaxWorkersPercent        = $maxWorkersPercent
+                        MaxSessionsPercent       = $maxSessionsPercent
+                        Notes                    = $memNote
                     })
             }
             catch { Add-ErrorRow $sub.Name 'AzureSQLDatabase' $db.Name $_.Exception.Message }
         }
     }
 
-    # --- 2.7 SQL Managed Instance: Avg/Max CPU % -------------------------------------------------
+    # --- 2.7 SQL Managed Instance: cores, state, storage + Max CPU/worker/IO utilization ----------
     # NOTE: Microsoft.Sql/managedInstances has no memory utilization metric in Azure Monitor
     # (confirmed against the live supported-metrics reference page - only CPU, worker, I/O, log
     # rate, storage and vCore count metrics are exposed), so MaxMemoryUsedPercent is always null
     # here with an explanatory note rather than a guessed/unsupported value.
-    Write-Host "  Collecting SQL Managed Instance CPU utilization..."
-    $sqlMis = Get-AzResource -ResourceType 'Microsoft.Sql/managedInstances'
+    Write-Host "  Collecting SQL Managed Instance configuration and utilization..."
+    $sqlMis = Get-AzSqlChildResourceFull -Path "/subscriptions/$($sub.Id)/providers/Microsoft.Sql/managedInstances" -ApiVersion '2021-11-01'
     foreach ($mi in $sqlMis) {
         try {
             $stat = Get-MonthlyMetricStat -ResourceId $mi.ResourceId -MetricName 'avg_cpu_percent'
+
+            $maxWorkersPercent = $null
+            try { $maxWorkersPercent = (Get-MonthlyMetricStat -ResourceId $mi.ResourceId -MetricName 'avg_workers_percent' -AggregationType @('Maximum')).Max } catch {}
+
+            # No single "storage used %" metric exists for MI, so it's derived from the Max of
+            # storage_space_used_mb against the instance's reserved_storage_mb (MB-for-MB, both
+            # queried at the same grain, so a same-hour Max/Max ratio is a safe worst-case estimate).
+            $maxStorageUsedMb = $null
+            try { $maxStorageUsedMb = (Get-MonthlyMetricStat -ResourceId $mi.ResourceId -MetricName 'storage_space_used_mb' -AggregationType @('Maximum')).Max } catch {}
+            $maxReservedStorageMb = $null
+            try { $maxReservedStorageMb = (Get-MonthlyMetricStat -ResourceId $mi.ResourceId -MetricName 'reserved_storage_mb' -AggregationType @('Maximum')).Max } catch {}
+            $maxStoragePercent = if ($maxStorageUsedMb -and $maxReservedStorageMb) { [math]::Round(($maxStorageUsedMb / $maxReservedStorageMb) * 100, 1) } else { $null }
+
             $sqlMiRows.Add([pscustomobject]@{
                     Subscription         = $sub.Name
                     ResourceGroup        = $mi.ResourceGroupName
                     InstanceName         = $mi.Name
                     Location             = $mi.Location
+                    Status               = $mi.Properties.state
+                    Edition              = $mi.Sku.Tier
+                    Cores                = $mi.Properties.vCores
+                    StorageSizeGB        = $mi.Properties.storageSizeInGB
                     AvgCpuPercent        = $stat.Avg
                     MaxCpuPercent        = $stat.Max
                     MaxMemoryUsedPercent = $null
+                    MaxWorkersPercent    = $maxWorkersPercent
+                    MaxStorageUsedMB     = $maxStorageUsedMb
+                    MaxReservedStorageMB = $maxReservedStorageMb
+                    MaxStoragePercent    = $maxStoragePercent
                     Notes                = 'Microsoft.Sql/managedInstances exposes no memory utilization metric in Azure Monitor.'
                 })
         }
         catch { Add-ErrorRow $sub.Name 'SQLManagedInstance' $mi.Name $_.Exception.Message }
     }
 
-    # --- 2.8 Cognitive Services: Max Provisioned-managed v2 utilization % ------------------------
-    Write-Host "  Collecting Cognitive Services provisioned-managed (PTU v2) utilization..."
+    # --- 2.8 Cognitive Services / AI Foundry: PTU (provisioned-managed) deployments only -----------
+    # Only accounts that have at least one Provisioned-managed deployment (Standard/GlobalStandard/
+    # etc. PAYG deployments are excluded entirely) are reported, one row per PTU deployment (not
+    # per account), each showing Max utilization over the trailing 30 days (not the report month).
+    # The metric is queried filtered/split by the `ModelDeploymentName` dimension so multi-deployment
+    # accounts report each deployment's own number instead of one blended account-level figure -
+    # this (plus simply not knowing which deployments were PTU) was the main reason the previous
+    # version could fail to return a value for every PTU deployment.
+    Write-Host "  Collecting Cognitive Services / AI Foundry PTU deployment utilization (last 30 days)..."
     $cogAccounts = Get-AzResource -ResourceType 'Microsoft.CognitiveServices/accounts'
     foreach ($acct in $cogAccounts) {
-        $stat = $null
-        $note = $null
         try {
-            $stat = Get-MonthlyMetricStat -ResourceId $acct.ResourceId -MetricName 'AzureOpenAIProvisionedManagedUtilizationV2' -AggregationType @('Maximum')
-        }
-        catch {
-            # A BadRequest here means the account doesn't support this metric at all (e.g. it isn't
-            # an Azure OpenAI resource, or has no provisioned-managed/PTU deployments) - that's an
-            # expected, normal outcome for many Cognitive Services accounts, not a script bug, so we
-            # record it as an informational note on the row instead of a Collection-Errors failure.
-            if ($_.Exception.Message -match 'BadRequest') {
-                $note = 'Metric not applicable to this account (likely not an Azure OpenAI resource, or has no provisioned-managed/PTU deployments).'
+            # Enumerate the account's model deployments directly via the control-plane REST API
+            # (there's no Resource Graph index for deployments, and this also avoids a dependency on
+            # the separate Az.CognitiveServices module), following nextLink in case of pagination.
+            $deployments = [System.Collections.Generic.List[object]]::new()
+            $nextPath = "$($acct.ResourceId)/deployments?api-version=2024-10-01"
+            while ($nextPath) {
+                $resp = Invoke-AzRestMethod -Path $nextPath -Method GET
+                if ($resp.StatusCode -ne 200) { break }
+                $body = $resp.Content | ConvertFrom-Json
+                if ($body.value) { foreach ($d in $body.value) { $deployments.Add($d) } }
+                $nextPath = if ($body.nextLink) { ($body.nextLink -replace '^https://[^/]+', '') } else { $null }
             }
-            else {
-                $note = "Metric query failed: $($_.Exception.Message)"
-                Add-ErrorRow $sub.Name 'CognitiveServices' $acct.Name $_.Exception.Message
+
+            # PTU SKUs are ProvisionedManaged, GlobalProvisionedManaged and DataZoneProvisionedManaged;
+            # standard/PAYG deployments (Standard, GlobalStandard, DataZoneStandard, ...) are skipped.
+            $ptuDeployments = $deployments | Where-Object { $_.sku.name -like '*ProvisionedManaged*' }
+            if (-not $ptuDeployments -or $ptuDeployments.Count -eq 0) { continue }
+
+            foreach ($dep in $ptuDeployments) {
+                $maxUtilPercent = $null
+                $note = $null
+                try {
+                    $stat = Get-MonthlyMetricStat -ResourceId $acct.ResourceId -MetricName 'AzureOpenAIProvisionedManagedUtilizationV2' -AggregationType @('Maximum') -MetricFilter "ModelDeploymentName eq '$($dep.name)'" -StartTime $Last30dStartDate -EndTime $Last30dEndDate
+                    $maxUtilPercent = $stat.Max
+                    if ($null -eq $maxUtilPercent) { $note = 'No utilization data reported in the last 30 days (deployment had no inference traffic in the window).' }
+                }
+                catch {
+                    $note = "Metric query failed: $($_.Exception.Message)"
+                    Add-ErrorRow $sub.Name 'CognitiveServices-PTU' "$($acct.Name)/$($dep.name)" $_.Exception.Message
+                }
+
+                $cogRows.Add([pscustomobject]@{
+                        Subscription                                        = $sub.Name
+                        ResourceGroup                                       = $acct.ResourceGroupName
+                        AccountName                                         = $acct.Name
+                        Location                                            = $acct.Location
+                        DeploymentName                                      = $dep.name
+                        ModelName                                           = $dep.properties.model.name
+                        ModelVersion                                        = $dep.properties.model.version
+                        PTUSkuName                                          = $dep.sku.name
+                        PTUCapacity                                         = $dep.sku.capacity
+                        MaxProvisionedManagedUtilizationV2PercentLast30Days = $maxUtilPercent
+                        Notes                                               = $note
+                    })
             }
         }
-        $cogRows.Add([pscustomobject]@{
-                Subscription                              = $sub.Name
-                ResourceGroup                             = $acct.ResourceGroupName
-                AccountName                               = $acct.Name
-                Location                                  = $acct.Location
-                MaxProvisionedManagedUtilizationV2Percent = $stat.Max
-                Notes                                     = $note
-            })
+        catch { Add-ErrorRow $sub.Name 'CognitiveServices' $acct.Name $_.Exception.Message }
     }
 }
 
@@ -627,10 +834,19 @@ $metricReference = @(
     [pscustomobject]@{ ResourceType = 'Log Analytics workspace (Sentinel)'; Metric = 'sku.capacityReservationLevel (resource property)'; Kind = 'ARM resource property'; Source = 'learn.microsoft.com/azure/templates/microsoft.operationalinsights/workspaces' }
     [pscustomobject]@{ ResourceType = 'Microsoft.Storage/storageAccounts/fileServices'; Metric = 'FileCapacity, FileShareCapacityQuota'; Kind = 'Azure Monitor metric'; Source = 'learn.microsoft.com/azure/azure-monitor/reference/supported-metrics/microsoft-storage-storageaccounts-fileservices-metrics' }
     [pscustomobject]@{ ResourceType = 'Microsoft.Sql/servers/databases'; Metric = 'cpu_percent'; Kind = 'Azure Monitor metric'; Source = 'learn.microsoft.com/azure/azure-monitor/reference/supported-metrics/microsoft-sql-servers-databases-metrics' }
+    [pscustomobject]@{ ResourceType = 'Microsoft.Sql/servers/databases'; Metric = 'sql_instance_cpu_percent'; Kind = 'Azure Monitor metric'; Source = 'learn.microsoft.com/azure/azure-monitor/reference/supported-metrics/microsoft-sql-servers-databases-metrics' }
     [pscustomobject]@{ ResourceType = 'Microsoft.Sql/servers/databases'; Metric = 'sql_instance_memory_percent'; Kind = 'Azure Monitor metric'; Source = 'learn.microsoft.com/azure/azure-monitor/reference/supported-metrics/microsoft-sql-servers-databases-metrics' }
-    [pscustomobject]@{ ResourceType = 'Microsoft.Sql/managedInstances'; Metric = 'avg_cpu_percent'; Kind = 'Azure Monitor metric'; Source = 'learn.microsoft.com/azure/azure-monitor/reference/supported-metrics/microsoft-sql-managedinstances-metrics' }
+    [pscustomobject]@{ ResourceType = 'Microsoft.Sql/servers/databases'; Metric = 'dtu_consumption_percent (DTU-based databases only)'; Kind = 'Azure Monitor metric'; Source = 'learn.microsoft.com/azure/azure-monitor/reference/supported-metrics/microsoft-sql-servers-databases-metrics' }
+    [pscustomobject]@{ ResourceType = 'Microsoft.Sql/servers/databases'; Metric = 'storage_percent (not applicable to Hyperscale/Data Warehouse)'; Kind = 'Azure Monitor metric'; Source = 'learn.microsoft.com/azure/azure-monitor/reference/supported-metrics/microsoft-sql-servers-databases-metrics' }
+    [pscustomobject]@{ ResourceType = 'Microsoft.Sql/servers/databases'; Metric = 'workers_percent, sessions_percent'; Kind = 'Azure Monitor metric'; Source = 'learn.microsoft.com/azure/azure-monitor/reference/supported-metrics/microsoft-sql-servers-databases-metrics' }
+    [pscustomobject]@{ ResourceType = 'Microsoft.Sql/servers/databases'; Metric = 'sku.tier, sku.capacity, sku.family, properties.status, properties.elasticPoolId, properties.secondaryType (Geo/Named/Standby)'; Kind = 'ARM resource property (direct REST list, not Get-AzResource - see note)'; Source = 'learn.microsoft.com/azure/templates/microsoft.sql/servers/databases' }
+    [pscustomobject]@{ ResourceType = 'Microsoft.Sql/servers/elasticPools'; Metric = 'cpu_percent, storage_percent, workers_percent, sessions_percent'; Kind = 'Azure Monitor metric'; Source = 'learn.microsoft.com/azure/azure-monitor/reference/supported-metrics/microsoft-sql-servers-elasticpools-metrics' }
+    [pscustomobject]@{ ResourceType = 'Microsoft.Sql/servers/elasticPools'; Metric = 'sku.tier, sku.capacity, sku.family, properties.perDatabaseSettings'; Kind = 'ARM resource property (direct REST list, not Get-AzResource - see note)'; Source = 'learn.microsoft.com/azure/templates/microsoft.sql/servers/elasticpools' }
+    [pscustomobject]@{ ResourceType = 'Microsoft.Sql/managedInstances'; Metric = 'avg_cpu_percent, avg_workers_percent, storage_space_used_mb, reserved_storage_mb'; Kind = 'Azure Monitor metric'; Source = 'learn.microsoft.com/azure/azure-monitor/reference/supported-metrics/microsoft-sql-managedinstances-metrics' }
     [pscustomobject]@{ ResourceType = 'Microsoft.Sql/managedInstances'; Metric = 'No memory metric exists for this resource type (confirmed against live docs)'; Kind = 'N/A'; Source = 'learn.microsoft.com/azure/azure-monitor/reference/supported-metrics/microsoft-sql-managedinstances-metrics' }
-    [pscustomobject]@{ ResourceType = 'Microsoft.CognitiveServices/accounts'; Metric = 'AzureOpenAIProvisionedManagedUtilizationV2'; Kind = 'Azure Monitor metric'; Source = 'learn.microsoft.com/azure/azure-monitor/reference/supported-metrics/microsoft-cognitiveservices-accounts-metrics' }
+    [pscustomobject]@{ ResourceType = 'Microsoft.Sql/managedInstances'; Metric = 'properties.vCores, properties.state, properties.storageSizeInGB, sku.tier'; Kind = 'ARM resource property (direct REST list, not Get-AzResource - see note)'; Source = 'learn.microsoft.com/azure/templates/microsoft.sql/managedinstances' }
+    [pscustomobject]@{ ResourceType = 'Microsoft.CognitiveServices/accounts/deployments'; Metric = 'AzureOpenAIProvisionedManagedUtilizationV2, filtered/split by the ModelDeploymentName dimension, over a trailing 30-day window; only accounts/deployments on a *ProvisionedManaged* (PTU) SKU are reported'; Kind = 'Azure Monitor metric'; Source = 'learn.microsoft.com/azure/azure-monitor/reference/supported-metrics/microsoft-cognitiveservices-accounts-metrics' }
+    [pscustomobject]@{ ResourceType = 'Microsoft.CognitiveServices/accounts/deployments'; Metric = 'deployments LIST (sku.name, sku.capacity, properties.model) via direct REST call'; Kind = 'REST API'; Source = 'learn.microsoft.com/rest/api/aiservices/accountmanagement/deployments/list' }
 )
 
 # ---------------------------------------------------------------------------
@@ -647,8 +863,9 @@ $sheets = [ordered]@{
     'AppServicePlan-CPU'    = $aspRows
     'Sentinel-Ingestion'    = $sentinelRows
     'StorageFilePremium'    = $fileRows
-    'AzureSQL-CPU'          = $sqlDbRows
-    'SQLMI-CPU'             = $sqlMiRows
+    'AzureSQL-Database'     = $sqlDbRows
+    'AzureSQL-ElasticPool'  = $sqlPoolRows
+    'SQLMI'                 = $sqlMiRows
     'CognitiveServices-PTU' = $cogRows
     'Metric-Reference'      = $metricReference
     'Collection-Errors'     = $errorRows
